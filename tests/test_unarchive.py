@@ -5,11 +5,14 @@
   全部拒绝整批、数据不变；
 * 影响计算：目标按 id 升序、每邮件将移除的引用数、仅本批删除后无人
   引用的附件 SHA-256 与可回收字节；预览只读且与执行同口径；
+* 快照一致性：预览的指纹校验与全部统计在单个只读数据库快照内完成，
+  分次读取期间被并发撤销/归档不会拼出失真估算；
 * 执行：单事务删除邮件/节点/引用，仅清理无人引用的附件；批外仍被
   引用的附件字节保留、可查可下载；任何失败回滚。
 """
 
 import hashlib
+import sqlite3
 
 import pytest
 
@@ -300,6 +303,197 @@ def test_attachment_outside_batch_untouched_in_impact(client):
     orphan_hashes = [o["sha256"] for o in r.json()["orphaned_attachments"]]
     assert orphan_hashes == [sha(PNG)]
     assert sha(PDF) not in orphan_hashes
+
+
+def test_preview_uses_single_snapshot_against_concurrent_unarchive(
+    client, monkeypatch
+):
+    """预览分次读取期间目标被另一请求撤销：全部数字仍取自同一快照。
+
+    旧实现三条 SELECT 各自自动提交读取：第一条读到删除前的目标行，随后
+    另一连接提交撤销，引用计数与孤儿统计就读到删除后的状态，拼出
+    “目标存在但 refs/孤儿/字节全为 0”的失真估算。修复后预览在单个
+    BEGIN DEFERRED 读快照内完成全部读取，仍按删除前状态自洽返回。
+    """
+
+    from app import database
+    from app import unarchive as unarchive_mod
+
+    m1 = post_msg(
+        client,
+        message_with_parts(
+            bin_part(PNG, ctype="image/png", filename="a.png"),
+            bin_part(PDF, filename="b.pdf"),
+        ),
+    )
+    png_sha, pdf_sha = sha(PNG), sha(PDF)
+
+    writer = database.connect(client.app.state.db_path)
+    # 在第一条 SELECT（目标行）之后、附件统计之前撤销 m1
+    original = unarchive_mod._fetch_messages
+
+    def racy_fetch(conn, ordered_ids):
+        rows = original(conn, ordered_ids)
+        with database.immediate_transaction(writer):
+            database.delete_messages_cascade(
+                writer, ordered_ids,
+                [o.sha256 for o in unarchive_mod._orphaned_attachments(
+                    writer, ordered_ids
+                )],
+            )
+        return rows
+
+    monkeypatch.setattr(unarchive_mod, "_fetch_messages", racy_fetch)
+    try:
+        r = unarchive(
+            client,
+            [{"id": m1["id"], "fingerprint": m1["fingerprint"]}],
+            preview=True,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["executed"] is False
+        assert body["target_count"] == 1
+        # 快照内一致：不能是“目标在、引用/字节却为 0”的拼接
+        assert body["attachment_refs_removed"] == 2
+        assert body["orphaned_attachment_count"] == 2
+        assert body["reclaimed_bytes"] == len(PNG) + len(PDF)
+        assert [o["sha256"] for o in body["orphaned_attachments"]] == sorted(
+            [png_sha, pdf_sha]
+        )
+        assert body["targets"][0]["attachment_refs_removed"] == 2
+        assert body["targets"][0]["fingerprint"] == m1["fingerprint"]
+    finally:
+        writer.close()
+        monkeypatch.undo()
+
+    # 并发撤销已落库：快照只影响预览读，不会把数据回滚回来
+    assert client.get(f"/messages/{m1['id']}").status_code == 404
+    assert client.get(f"/attachments/{png_sha}/content").status_code == 404
+
+    # 快照已释放：再次预览当前数据，目标确实已不存在 → 既有 404
+    r2 = unarchive(
+        client,
+        [{"id": m1["id"], "fingerprint": m1["fingerprint"]}],
+        preview=True,
+    )
+    assert r2.status_code == 404
+    assert r2.json()["detail"]["code"] == "UNARCHIVE_MESSAGE_NOT_FOUND"
+
+
+def test_preview_snapshot_remains_read_only_when_concurrent_archive_commits(
+    client, monkeypatch
+):
+    """持有读快照期间另一连接可以提交写入（WAL 不互相阻塞）。"""
+
+    from app import database, unarchive as unarchive_mod
+
+    m1 = post_msg(client, message_with_parts(bin_part(PNG, filename="a.png")))
+    writer = database.connect(client.app.state.db_path)
+
+    original = unarchive_mod._fetch_messages
+
+    def racy_fetch(conn, ordered_ids):
+        rows = original(conn, ordered_ids)
+        # 快照持有期间另一连接直接提交一条新邮件（占位行即可）
+        with writer:
+            cur = writer.execute(
+                "INSERT INTO messages"
+                " (fingerprint, raw_sha256, canonical_json, content_type,"
+                "  size_bytes, created_at)"
+                " VALUES (?, ?, '{}', 'text/plain', 1, ?)",
+                ("f" * 64, "r" * 64, "2026-01-01T00:00:00+00:00"),
+            )
+            assert int(cur.lastrowid) > 0
+        return rows
+
+    monkeypatch.setattr(unarchive_mod, "_fetch_messages", racy_fetch)
+    try:
+        r = unarchive(
+            client,
+            [{"id": m1["id"], "fingerprint": m1["fingerprint"]}],
+            preview=True,
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # 预览仍只含快照中的 m1 一个目标，看不到快照之后的新行
+        assert body["target_count"] == 1
+        assert [t["id"] for t in body["targets"]] == [m1["id"]]
+    finally:
+        writer.close()
+        monkeypatch.undo()
+
+    # 并发提交在预览后可见
+    assert client.get("/messages").json()["total"] == 2
+
+
+def test_read_only_snapshot_blocks_writes_and_releases(client):
+    """快照块内禁止写入；ROLLBACK 退出后同一连接恢复可写。"""
+
+    from app import database
+
+    insert_sql = (
+        "INSERT INTO messages"
+        " (fingerprint, raw_sha256, canonical_json, content_type,"
+        "  size_bytes, created_at)"
+        " VALUES (?, ?, '{}', 'text/plain', 0, '2026-01-01T00:00:00+00:00')"
+    )
+    conn = database.connect(client.app.state.db_path)
+    try:
+        with database.read_only_snapshot(conn):
+            with pytest.raises(sqlite3.Error):
+                # query_only 兜底：快照内任何写都被拒绝
+                conn.execute(insert_sql, ("a" * 64, "b" * 64))
+        # 快照释放、query_only 恢复：连接照常读写
+        with database.transaction(conn):
+            conn.execute(insert_sql, ("a" * 64, "b" * 64))
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) AS c FROM messages WHERE fingerprint = ?",
+                ("a" * 64,),
+            ).fetchone()["c"]
+            == 1
+        )
+    finally:
+        conn.close()
+
+
+def test_preview_404_when_target_already_unarchived_before_snapshot(client):
+    """目标在快照建立之前已撤销：仍按既有 404 拒绝整批。"""
+
+    m1 = post_msg(client, message_with_parts(bin_part(PNG, filename="a.png")))
+    unarchive(client, [{"id": m1["id"], "fingerprint": m1["fingerprint"]}])
+    r = unarchive(
+        client,
+        [{"id": m1["id"], "fingerprint": m1["fingerprint"]}],
+        preview=True,
+    )
+    assert r.status_code == 404
+    detail = r.json()["detail"]
+    assert detail["code"] == "UNARCHIVE_MESSAGE_NOT_FOUND"
+    assert detail["id"] == m1["id"]
+
+
+def test_preview_fingerprint_mismatch_409_inside_snapshot(client):
+    """快照中指纹不符仍按既有 409 处理（只读、数据不变）。"""
+
+    m1 = post_msg(client, message_with_parts(bin_part(PNG, filename="a.png")))
+    before_total = client.get("/messages").json()["total"]
+    r = unarchive(
+        client,
+        [{"id": m1["id"], "fingerprint": "f" * 64}],
+        preview=True,
+    )
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["code"] == "UNARCHIVE_FINGERPRINT_MISMATCH"
+    assert detail["id"] == m1["id"]
+    assert detail["provided_fingerprint"] == "f" * 64
+    assert detail["current_fingerprint"] == m1["fingerprint"]
+    assert client.get("/messages").json()["total"] == before_total
+    assert client.get(f"/messages/{m1['id']}").status_code == 200
+    # 只读快照已正常释放，同一请求连接关闭后新请求不受影响
+    assert client.get("/health").status_code == 200
 
 
 # ---------------------------------------------------------------------------

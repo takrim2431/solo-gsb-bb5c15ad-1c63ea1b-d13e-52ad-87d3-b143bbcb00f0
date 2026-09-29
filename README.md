@@ -154,6 +154,61 @@ FastAPI 参数校验 **422**。
   `reclaimed_bytes`：无人引用附件的字节合计（同一内容无论被引用多少次
   只计一份字节）。
 
+**预览的一致性快照（重要用法）**：预览的指纹校验、目标信息、各目标
+附件引用数、孤儿附件与可回收字节全部在**同一个只读数据库快照**
+（`BEGIN DEFERRED`，并以 `PRAGMA query_only` 兜底只读；WAL 下不阻塞
+其他请求的归档/撤销）内读取并返回，响应数字彼此自洽——不会出现目标
+信息取自删除前、附件统计取自删除后的拼接估算。快照**建立前**目标已被
+撤销仍按既有 **404** 拒绝整批；快照内指纹不符仍按既有 **409** 处理。
+请求成功后快照以 `ROLLBACK` 释放，数据库不发生任何变化。
+
+**预览不代表执行承诺**：预览与执行是两个独立请求，**两者之间数据库
+可能已被其他归档/撤销改变**。预览成功只表示“在那一刻的快照上凭据
+有效、影响如此”；执行（`preview=false`/缺省）会在**单个
+`BEGIN IMMEDIATE` 写事务内对当前数据重新做全部校验和计算**，不会复用
+预览结果。因此执行时仍可能收到：
+
+- **404**（`UNARCHIVE_MESSAGE_NOT_FOUND`）：目标已在预览后被另一
+  请求撤销——按当前状态认为整批已不适用，整批拒绝、数据不变；
+- **409**（`UNARCHIVE_FINGERPRINT_MISMATCH`）：目标被重新归档或凭据
+  过期——可取回当前指纹后重试；
+- 成功响应中的 `attachment_refs_removed` / `orphaned_attachments` /
+  `reclaimed_bytes` 以**执行事务内重新计算**的当前值为准，可能与预览
+  不同（例如批外邮件恰好释放/新增了对共享附件的引用）。
+
+建议用法：先 `preview=true` 给用户确认回收估算；确认后立即执行；执行
+收到 **404/409** 时重新预览（或重新读取 `/messages/{id}` 获取当前
+指纹）并提示用户在最新状态上再次确认，**不要**凭预览结果假定执行必然
+成功或字节数一致。
+
+```bash
+# Python：预览 → 用户确认 → 执行；404/409 时重新预览
+python3 - <<'PY'
+import requests
+
+BASE = "http://localhost:8000"
+targets = [{"id": 1, "fingerprint": "58d92498…431"}]
+
+preview = requests.post(f"{BASE}/messages/unarchive", json={
+    "preview": True, "messages": targets,
+})
+preview.raise_for_status()
+est = preview.json()
+print("将回收字节（按预览快照）：", est["reclaimed_bytes"])
+
+r = requests.post(f"{BASE}/messages/unarchive", json={"messages": targets})
+if r.status_code == 404:
+    print("目标在预览后已被撤销：", r.json()["detail"])
+elif r.status_code == 409:
+    d = r.json()["detail"]
+    print("指纹已变化，请按当前指纹重试：", d["current_fingerprint"])
+else:
+    r.raise_for_status()
+    done = r.json()
+    print("已执行，实际回收字节（以执行时数据为准）：", done["reclaimed_bytes"])
+PY
+```
+
 ```json
 {
   "executed": false,

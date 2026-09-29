@@ -130,6 +130,32 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
 
 
 @contextmanager
+def read_only_snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """在**单个只读数据库快照**内执行一段查询（``BEGIN DEFERRED``）。
+
+    用于撤销归档预览这类“先凭据校验、再做多组关联统计”的只读请求：进入
+    事务后第一条读语句取得读快照，此后同连接上的所有读都固定在该快照上
+    ——即使其他连接在此期间提交了归档/撤销，块内的指纹校验、目标行、
+    各目标附件引用数、孤儿附件与可回收字节统计也来自**同一快照**，不会
+    出现“删除前的目标信息 + 删除后的附件统计”的拼接。
+
+    块内不允许也不需要写入：``PRAGMA query_only=ON`` 作为第二道只读
+    保险，结束统一以 ``ROLLBACK`` 释放快照（无变更可提交），随后恢复
+    ``query_only``。WAL 下持有读快照不阻塞其他连接的读写。调用方在块内
+    做凭据校验时，目标在快照建立前已被删除则按既有口径抛 404，指纹在
+    快照中不符则抛 409——两者都以同一快照为准。
+    """
+
+    conn.execute("PRAGMA query_only = ON")
+    conn.execute("BEGIN DEFERRED")
+    try:
+        yield conn
+    finally:
+        conn.rollback()
+        conn.execute("PRAGMA query_only = OFF")
+
+
+@contextmanager
 def immediate_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     """立即获取写锁的事务（``BEGIN IMMEDIATE``）。
 
