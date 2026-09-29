@@ -153,11 +153,13 @@ app = FastAPI(
         "跨邮件同 UID 按 SEQUENCE/DTSTAMP/message_id 选当前版本，CANCEL "
         "标为已取消并保留来源，按起始时间与 UID 稳定排序。"
         "POST /messages/unarchive 按 {id, 当前指纹} 批量撤销归档：空列表、"
-        "重复 id、邮件缺失或指纹不符拒绝整批且数据不变；preview=true 与"
-        "执行共用同一影响计算（目标按 id 升序、将移除的附件引用数、仅本批"
-        "删除后无人引用的附件 SHA-256 与可回收字节），执行在单个 "
-        "BEGIN IMMEDIATE 事务内删除邮件/节点/引用并仅清理无人引用的附件，"
-        "仍被其他邮件引用的字节保留可查可下载，任何失败整体回滚。"
+        "重复 id、邮件缺失或指纹不符拒绝整批且数据不变；preview=true 在"
+        "单一只读数据库快照内完成校验与影响计算（目标按 id 升序、将移除"
+        "的附件引用数、仅本批删除后无人引用的附件 SHA-256 与可回收字节，"
+        "全部同一版本、纯只读），结果只按该快照解释；执行在单个 "
+        "BEGIN IMMEDIATE 事务内对当前数据重新校验后删除邮件/节点/引用并"
+        "仅清理无人引用的附件，仍被其他邮件引用的字节保留可查可下载，"
+        "任何失败整体回滚。"
     ),
     version="1.11.0",
     lifespan=lifespan,
@@ -351,6 +353,12 @@ def unarchive_messages(
     ``reclaimed_bytes`` 为其字节合计；仍被批外邮件引用的附件不出现、
     字节保持可查可下载。预览为只读，``executed=false``。
 
+    预览的指纹校验、目标行、附件引用数、孤儿附件与可回收字节在**同一
+    只读数据库快照**上取得：快照建立前目标已撤销仍按 404 拒绝整批，
+    指纹不符仍按 409 处理；成功结果只解释该快照，预览与执行之间数据
+    可能已被其他请求改变，因此执行会在写事务内对当前数据重新校验与
+    计算，预览不构成对执行结果的承诺。
+
     执行（``preview=false`` 或缺省）在**单个 ``BEGIN IMMEDIATE``
     事务**内重新校验凭据并删除：目标邮件的附件引用 → 仅无人引用的
     附件实体（删除再以 ``NOT EXISTS`` 兜底）→ 节点 → 邮件；任何失败
@@ -360,8 +368,12 @@ def unarchive_messages(
     items = [(m.id, m.fingerprint) for m in payload.messages]
 
     if payload.preview:
-        # 纯只读：普通 SELECT 不开启写事务，绝不修改数据。
-        impact = validate_and_compute_impact(conn, items)
+        # 纯只读：单一只读快照事务（BEGIN + 共享读锁，无任何写入），
+        # 指纹校验、目标信息、各目标附件引用数、孤儿附件与可回收字节
+        # 全部读同一数据库版本，不会被进行中提交的并发撤销/归档撕裂。
+        # 结果只按该快照解释；真正执行时仍在下方写事务内重新校验计算。
+        with database.read_snapshot(conn):
+            impact = validate_and_compute_impact(conn, items)
         executed = False
     else:
         # BEGIN IMMEDIATE：进入即持写锁，凭据校验与删除原子串行。

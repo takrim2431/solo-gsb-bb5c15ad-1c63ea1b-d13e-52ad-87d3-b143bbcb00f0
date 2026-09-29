@@ -10,8 +10,18 @@
    的集合与执行时真正清理的集合完全一致）；仍被批外邮件引用的附件不
    在其中，字节保持可查可下载。
 
-真正的删除在 :mod:`app.database` 的单个事务内完成
-（``delete_messages_cascade``），任何失败整体回滚。
+本函数依次发出多条只读 SELECT，自身**不开启事务**；为使凭据校验与
+影响计算基于**同一数据库快照**，调用方必须在单一事务内调用：
+
+* 预览：``database.read_snapshot(conn)``（只读延迟事务，快照内一致、
+  绝不写入）；
+* 执行：``database.immediate_transaction(conn)``（``BEGIN IMMEDIATE``，
+  在持写锁的事务内对当前数据重新校验后删除）。
+
+这样目标在快照建立前已被其他请求撤销时仍按 404 拒绝整批，快照建立
+之后的并发改动不会撕裂本次结果（删除前目标信息 + 删除后附件统计的
+失真组合不再可能）。真正的删除在 :mod:`app.database` 的单个事务内
+完成（``delete_messages_cascade``），任何失败整体回滚。
 """
 
 from __future__ import annotations
@@ -80,6 +90,10 @@ def validate_and_compute_impact(
     ``items`` 为请求中的目标（保持请求顺序，用于报告重复出现位置）。
     校验全部通过才返回影响；任一失败抛出
     :class:`UnarchiveValidationError`，不触碰数据。
+
+    调用方必须让本函数运行在单一事务内（预览用只读快照事务、执行用
+    ``BEGIN IMMEDIATE`` 写事务）：函数内多条 SELECT 由此读到同一数据
+    库版本，校验与影响计算不会被并发提交撕裂。
     """
 
     # 1) 空列表拒绝。

@@ -130,6 +130,33 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
 
 
 @contextmanager
+def read_snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """只读快照事务（``BEGIN`` 延迟事务，获取共享读锁）。
+
+    用于撤销归档预览这类“多条只读查询必须基于同一数据库版本”的请求：
+    进入事务后首次 SELECT 建立快照，快照事务内随后的全部 SELECT 都读
+    同一版本——其他连接在事务进行中提交的归档 / 撤销对本事务不可见，
+    从而保证凭据校验、目标行、附件引用计数、孤儿附件与可回收字节口径
+    一致，不会把删除前的目标信息和删除后的附件统计拼在一起。
+
+    全程只有 SELECT：不获取写锁、绝不修改数据，退出时统一提交（结束
+    读事务、释放共享锁）。SQLite 无回滚版本错误，读事务期间其他写入
+    可照常提交；它们只在本快照之后才对后续请求可见。
+
+    注意快照只对**这一次预览**自洽，不能替代执行时在
+    :func:`immediate_transaction` 内对当前数据重新校验与计算。
+    """
+
+    conn.execute("BEGIN")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+@contextmanager
 def immediate_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     """立即获取写锁的事务（``BEGIN IMMEDIATE``）。
 

@@ -302,6 +302,154 @@ def test_attachment_outside_batch_untouched_in_impact(client):
     assert sha(PDF) not in orphan_hashes
 
 
+def _race_delete(db_path: str, message_id: int, orphan_sha256s: list[str]) -> None:
+    """用**独立连接**模拟“另一请求”在单个 BEGIN IMMEDIATE 事务内撤销。"""
+
+    from app import database
+
+    other = database.connect(db_path)
+    try:
+        with database.immediate_transaction(other):
+            database.delete_messages_cascade(
+                other, [message_id], orphan_sha256s
+            )
+    finally:
+        other.close()
+
+
+def test_preview_reads_consistent_snapshot_when_race_commits_midway(
+    client, monkeypatch
+):
+    # 预览的目标查询/指纹校验已完成、附件统计尚未开始时，另一请求把目标
+    # 撤销并提交。预览必须整体按删除前的同一快照解释：目标信息与附件
+    # 统计不得撕裂成“目标还在 + 引用 0 / 无孤儿 / 0 字节”的失真估算。
+    from app import unarchive as unarchive_mod
+
+    m1 = post_msg(
+        client,
+        message_with_parts(
+            bin_part(PNG, ctype="image/png", filename="a.png"),
+            bin_part(PDF, filename="b.pdf"),
+        ),
+    )
+    png_sha, pdf_sha = sha(PNG), sha(PDF)
+    db_path = client.app.state.db_path
+
+    real_ref_counts = unarchive_mod._attachment_ref_counts
+    fired = {"n": 0}
+
+    def racing_ref_counts(conn, ordered_ids):
+        if fired["n"] == 0:
+            fired["n"] += 1
+            _race_delete(db_path, m1["id"], [png_sha, pdf_sha])
+        return real_ref_counts(conn, ordered_ids)
+
+    monkeypatch.setattr(unarchive_mod, "_attachment_ref_counts", racing_ref_counts)
+
+    r = unarchive(
+        client, [{"id": m1["id"], "fingerprint": m1["fingerprint"]}], preview=True
+    )
+    assert fired["n"] == 1
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    # 成功结果按快照解释：目标在、2 行引用、2 个孤儿、字节为两附件之和
+    assert body["executed"] is False
+    assert body["target_count"] == 1
+    assert body["targets"][0]["id"] == m1["id"]
+    assert body["targets"][0]["attachment_refs_removed"] == 2
+    assert body["attachment_refs_removed"] == 2
+    assert body["orphaned_attachment_count"] == 2
+    assert [o["sha256"] for o in body["orphaned_attachments"]] == sorted(
+        [png_sha, pdf_sha]
+    )
+    assert body["reclaimed_bytes"] == len(PNG) + len(PDF)
+
+    # 并发撤销确实在预览期间落库——预览不承诺其返回后的当前状态
+    assert client.get(f"/messages/{m1['id']}").status_code == 404
+    assert client.get(f"/attachments/{png_sha}/content").status_code == 404
+    assert client.get(f"/attachments/{pdf_sha}/content").status_code == 404
+
+
+def test_preview_target_deleted_before_snapshot_established_still_404(
+    client, monkeypatch
+):
+    # 撤销在预览快照的第一次读取前提交：目标对快照本就不存在，
+    # 仍按现有 404 拒绝整批。
+    from app import unarchive as unarchive_mod
+
+    m1 = post_msg(client, message_with_parts(bin_part(PNG, filename="a.png")))
+    png_sha = sha(PNG)
+    db_path = client.app.state.db_path
+
+    real_fetch = unarchive_mod._fetch_messages
+    fired = {"n": 0}
+
+    def racing_fetch(conn, ordered_ids):
+        if fired["n"] == 0:
+            fired["n"] += 1
+            _race_delete(db_path, m1["id"], [png_sha])
+        return real_fetch(conn, ordered_ids)
+
+    monkeypatch.setattr(unarchive_mod, "_fetch_messages", racing_fetch)
+
+    r = unarchive(
+        client, [{"id": m1["id"], "fingerprint": m1["fingerprint"]}], preview=True
+    )
+    assert fired["n"] == 1
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"]["code"] == "UNARCHIVE_MESSAGE_NOT_FOUND"
+    assert r.json()["detail"]["id"] == m1["id"]
+    assert client.get(f"/messages/{m1['id']}").status_code == 404
+
+
+def test_preview_does_not_block_concurrent_writer(client, monkeypatch):
+    # 快照是只读延迟事务：预览进行中（快照已建立）另一请求仍可提交写入。
+    import threading
+
+    from app import unarchive as unarchive_mod
+
+    m1 = post_msg(client, message_with_parts(bin_part(PNG, filename="a.png")))
+    m2_data = message_with_parts(bin_part(PDF, filename="b.pdf"), subject="m2")
+    entered = threading.Event()
+    release = threading.Event()
+    outcome = {}
+
+    real_orphans = unarchive_mod._orphaned_attachments
+
+    def slow_orphans(conn, ordered_ids):
+        entered.set()
+        release.wait(timeout=5)
+        return real_orphans(conn, ordered_ids)
+
+    monkeypatch.setattr(unarchive_mod, "_orphaned_attachments", slow_orphans)
+
+    def preview():
+        r = unarchive(
+            client,
+            [{"id": m1["id"], "fingerprint": m1["fingerprint"]}],
+            preview=True,
+        )
+        outcome["preview"] = r.status_code
+
+    t = threading.Thread(target=preview)
+    t.start()
+    assert entered.wait(timeout=5)
+    # 快照已建立并停在孤儿统计：并发归档另一封邮件必须能提交
+    r2 = client.post("/messages", content=m2_data)
+    outcome["create_status"] = r2.status_code
+    outcome["new_id"] = r2.json().get("id")
+    release.set()
+    t.join(timeout=5)
+
+    assert not t.is_alive()
+    assert outcome["create_status"] == 201, outcome
+    assert outcome["preview"] == 200, outcome
+    # 预览快照在并发归档之前建立：只看到 m1 的 1 个孤儿，
+    # 并发新归档的邮件对快照不可见、但对之后的请求可见
+    assert client.get(f"/messages/{outcome['new_id']}").status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # 执行：事务删除
 # ---------------------------------------------------------------------------
