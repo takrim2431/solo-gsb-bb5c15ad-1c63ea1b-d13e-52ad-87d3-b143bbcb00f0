@@ -1,0 +1,15 @@
+services:
+  mime-api:
+    build: .
+    image: mime-fingerprint-api:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite 数据库文件位置（容器内）；启动时自动建表
+      MIME_DB_PATH: /data/mime.db
+    volumes:
+      - mime-data:/data
+    restart: unless-stopped
+
+volumes:
+  mime-data:
